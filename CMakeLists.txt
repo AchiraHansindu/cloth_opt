@@ -116,6 +116,13 @@ endif()
 
 # Add Openvdb
 list(APPEND CMAKE_MODULE_PATH "/usr/local/lib/cmake/OpenVDB")
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/deps/openvdb/cmake")
+# Ubuntu's OpenVDB 8.1 is built against IlmBase 2.5 Half, but FindOpenVDB.cmake
+# expects standalone Imath 3.x. Point find_package(Imath CONFIG) at a shim that
+# wraps the installed IlmBase libs. See cmake/imath-shim/ImathConfig.cmake.
+if(NOT DEFINED Imath_DIR)
+  set(Imath_DIR "${CMAKE_SOURCE_DIR}/cmake/imath-shim")
+endif()
 find_package(OpenVDB REQUIRED)
 
 # Add polyscope
@@ -192,6 +199,7 @@ endfunction()
 add_main_executable(Visualization visual.cpp)
 add_main_executable(Simulation simulation.cpp)
 add_main_executable(Optimization optimization.cpp)
+add_main_executable(Folding folding.cpp)
 
 # Print configuration summary
 message(STATUS "")

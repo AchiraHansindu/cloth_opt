@@ -1,0 +1,33 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${workspaceFolder}/.vscode/browse.vc.db",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/home/achiraubuntu/arm_ws/moveit_integration/install/arm_link_hardware/include/**",
+        "/home/achiraubuntu/bumperbot_ws/install/bumperbot_planning/include/**",
+        "/home/achiraubuntu/bumperbot_ws/install/bumperbot_cpp_examples/include/**",
+        "/home/achiraubuntu/bumperbot_ws/install/bumperbot_msgs/include/**",
+        "/home/achiraubuntu/bumperbot_ws/install/bumperbot_motion/include/**",
+        "/home/achiraubuntu/bumperbot_ws/install/bumperbot_mapping/include/**",
+        "/home/achiraubuntu/bumperbot_ws/install/bumperbot_localization/include/**",
+        "/home/achiraubuntu/bumperbot_ws/install/bumperbot_firmware/include/**",
+        "/home/achiraubuntu/bumperbot_ws/install/bumperbot_controller/include/**",
+        "/home/achiraubuntu/navigation_ws/install/smrr_navigation/include/**",
+        "/home/achiraubuntu/navigation_ws/install/smrr_interfaces/include/**",
+        "/home/achiraubuntu/navigation_ws/install/smrr_base_controller/include/**",
+        "/opt/ros/humble/include/**",
+        "/home/achiraubuntu/Desktop/cloth_opt/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ros2",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++17"
+    }
+  ],
+  "version": 4
+}
