@@ -60,6 +60,21 @@ struct FoldParams {
   GripMode grip = GripMode::All;
   double stiffness = 800.0, bending = 20.0, damping = 0.9, dt = 0.01, settle = 1.5, h = 0.25;
   bool realGravity = false, layerClamp = false;
+
+  // FOLDING_FINAL_FORMULATION §elliptical-family: alpha is the elliptical
+  // height ratio scaling ONLY the vertical (yHat) semi-axis of each vertex
+  // arc. alpha = 1 is the exact rigid semicircle (zero stretch); alpha < 1
+  // lowers the path so the material column (length r) has slack (1-alpha)*r
+  // and buckles (less lift, some stretch); alpha > 1 stretches the sheet and
+  // is Pareto-dominated. Search allows up to 1.2 so the optimizer confirms
+  // rather than assumes the alpha* ~= 1 optimum.
+  double alpha = 1.0;        // elliptical height ratio: 1 = rigid arc; <1 lowers path (slack); >1 stretches
+  int    substeps = 1;       // integrator substeps per control step (stability for stiff / restored gravity)
+  double gravityScale = 1.0; // multiplies restored gravity; continuous replacement for the realGravity boolean
+  // gravityScale resolution (backward compat with realGravity): if
+  // realGravity is true and gravityScale == 1.0, use gravityScale = N*N (the
+  // old E2b behavior); otherwise gravityScale is used directly. See
+  // resolveGravityScale() in the driver.
 };
 
 struct FoldMetrics {
@@ -69,6 +84,7 @@ struct FoldMetrics {
   int    interpenetrations = 0;                // M6
   double residualKE = 0;                       // M8, mean KE of M over last 1 s of settle
   bool   finite = true;                        // NaN guard
+  double gripperEnergy = 0;  // E: sum over steps and gripped vertices of max(0, F . dx), non-regenerative
 };
 
 class FoldingOptimizer {
@@ -120,6 +136,17 @@ public:
   // point): re-arms gain/maxForce after every setTrajectory call.
   void applyFoldingTrajectory(ClothController&, const std::vector<TrajectoryPoint>&,
                               double gain, double maxForce);
+
+  // g-fold trajectory (van den Berg / Miller et al. eq. (1)): the gravity-
+  // based real-world folding path. A gripped point at fold-line distance y_v
+  // follows x = x_v, y = y_b, z = y_v - |y_b| as the baseline y_b sweeps
+  // y_v -> -y_v: a 45-degree rise to peak height r above the crease then a
+  // mirrored descent, with the ungripped cloth left to hang (needs
+  // gravityScale > 1 and substeps to read visibly). Closed-form path — the
+  // papers' "optimization" is perception-side, not the trajectory. Drives
+  // the OneCorner diagonal grip. See FOLDING_FINAL_FORMULATION §g-fold.
+  std::vector<TrajectoryPoint> gFoldTrajectory(const ClothMesh&, Corner startCorner,
+                                               Corner endCorner, FoldParams params);
 
 private:
   int W_, H_; double s_;

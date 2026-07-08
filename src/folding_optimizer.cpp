@@ -236,14 +236,27 @@ std::vector<size_t> FoldingOptimizer::gripSet(const FoldSpec& spec, GripMode mod
 }
 
 // ---------------------------------------------------------------------------
-// arc — semicircular sweep about the crease with cosine easing (§5, §6)
+// arc — elliptical sweep about the crease with cosine easing (§5, §6;
+//        FOLDING_FINAL_FORMULATION §elliptical-family)
 //
-// Each gripped vertex sweeps a semicircle about the crease. With
+// Each gripped vertex sweeps an arc about the crease. With
 // c_v = p0 - r_v nHat (foot of the perpendicular on the crease; with crease
 // slack delta: r_eff = r_v - delta and c_eff = p0 - r_eff nHat):
 //
-//   gamma(theta) = c_eff + r_eff (cos(theta) nHat + sin(theta) yHat)
-//                  + (theta/pi) eps yHat ,      theta: 0 -> pi
+//   gamma(theta; alpha) = c_eff + r_eff cos(theta) nHat
+//                         + alpha r_eff sin(theta) yHat
+//                         + (theta/pi) eps yHat ,      theta: 0 -> pi
+//
+// alpha multiplies the VERTICAL (yHat) term ONLY — never the cos(theta) nHat
+// term. Reason: the start (theta=0) and mirror-end (theta=pi) are fixed
+// boundary conditions at horizontal offsets +r and -r; scaling cos(theta)
+// would move those endpoints and the fold would not complete. So the
+// horizontal semi-axis is pinned at r; only the height is free. alpha = 1 is
+// the exact rigid semicircle (zero stretch); alpha < 1 lowers the path so the
+// midpoint distance alpha*r < r leaves the material column slack (1-alpha)*r
+// (it buckles: less lift, some stretch); alpha > 1 stretches the sheet
+// (span > material length) and is Pareto-dominated. delta and alpha are
+// independent: delta shrinks the radius (crease slack), alpha scales height.
 //
 // Timing (§6): cosine easing theta_k = (pi/2)(1 - cos(pi k/K)) at
 // t_k = T k/K, k = 0..K — zero angular velocity at both endpoints.
@@ -277,8 +290,10 @@ std::vector<Eigen::Vector3d> FoldingOptimizer::arc(const Eigen::Vector3d& p0, co
   for (int k = 0; k <= params.K; ++k) {
     const double theta = (kPi / 2.0) * (1.0 - std::cos(kPi * k / params.K));
     const double t = params.T * k / params.K;       // t_0 = 0 exactly (E6 trap 2)
+    // alpha on yHat only (fixed endpoints pin the horizontal semi-axis at r).
     pts.push_back(cEff
-                  + rEff * (std::cos(theta) * spec.creaseNormal + std::sin(theta) * kYHat)
+                  + rEff * std::cos(theta) * spec.creaseNormal
+                  + params.alpha * rEff * std::sin(theta) * kYHat
                   + (theta / kPi) * params.eps * kYHat);
     timesOut.push_back(t);
   }
@@ -374,6 +389,62 @@ void FoldingOptimizer::applyFoldingTrajectory(ClothController& controller,
     controller.setTrajectory(v, positions, times, false);
     controller.addPositionControl(v, positions[0], gain, maxForce);  // re-arm gains (E6 trap 1)
   }
+}
+
+// ---------------------------------------------------------------------------
+// gFoldTrajectory — gravity-based g-fold (van den Berg / Miller et al. eq. (1);
+//                   FOLDING_FINAL_FORMULATION §g-fold)
+//
+// The real-world folding path: instead of a rigid arc, the gripper lifts the
+// gripped corner along a 45-degree segment to peak height r above the crease,
+// then descends mirrored — a triangle |perp| + height = r in the
+// (fold-perpendicular, height) plane — while the UNGRIPPED cloth is left to
+// hang under gravity (so this needs gravityScale > 1 and substeps to read).
+//
+// Eq. (1): a gripped point at fold-line distance y_v follows x = x_v (along
+// the crease, unchanged), z = y_b (fold-perpendicular, swept y_v -> -y_v),
+// y = y_v - |y_b| (height, peaking at y_v). Mapping to our frame with foot of
+// perpendicular c_v = p0 - r nHat (on the crease at height h) and sweeping
+// the perpendicular as y_b = r cos(theta):
+//
+//   gamma(theta) = c_v + r cos(theta) nHat
+//                  + r (1 - |cos(theta)|) yHat        (triangular lift)
+//                  + (theta/pi) eps yHat              (stacking gap)
+//
+// Endpoints match the arc's: theta=0 -> p0, theta=pi -> mirror + eps yHat, so
+// the fold still LANDS at the same mirror target. This is a closed-form path;
+// the papers' "optimization" is perception-side, not the trajectory. Times
+// use the same cosine easing as arc (§6). Drives the OneCorner diagonal grip.
+// ---------------------------------------------------------------------------
+std::vector<TrajectoryPoint> FoldingOptimizer::gFoldTrajectory(const ClothMesh& cloth,
+                                                               Corner startCorner,
+                                                               Corner endCorner,
+                                                               FoldParams params) {
+  const double h = cloth.getVertex(0).position.y();
+  const FoldSpec spec = computeFoldSpec(h, startCorner, endCorner, params.delta, params.eps);
+  std::vector<TrajectoryPoint> out;
+  if (spec.moving.empty()) return out;
+
+  for (size_t v : gripSet(spec, params.grip)) {
+    const Eigen::Vector3d p0 = cloth.getVertex(v).position;
+    const double r = (p0 - spec.creasePoint).dot(spec.creaseNormal);
+    const Eigen::Vector3d cFoot = p0 - r * spec.creaseNormal;   // on the crease, height h
+    if (r <= kTol) { out.push_back({ v, p0, 0.0 }); continue; }  // degenerate: hold in place
+    for (int k = 0; k <= params.K; ++k) {
+      const double theta = (kPi / 2.0) * (1.0 - std::cos(kPi * k / params.K));  // §6 easing
+      const double t = params.T * k / params.K;                  // t_0 = 0 exactly (E6)
+      const double yb = r * std::cos(theta);                     // perpendicular sweep r -> -r
+      const Eigen::Vector3d pos = cFoot + yb * spec.creaseNormal
+                                  + r * (1.0 - std::abs(std::cos(theta))) * kYHat
+                                  + (theta / kPi) * params.eps * kYHat;
+      out.push_back({ v, pos, t });
+    }
+  }
+  std::sort(out.begin(), out.end(), [](const TrajectoryPoint& a, const TrajectoryPoint& b) {
+    if (a.vertexIndex != b.vertexIndex) return a.vertexIndex < b.vertexIndex;
+    return a.time < b.time;
+  });
+  return out;
 }
 
 } // namespace ClothOpt

@@ -1,15 +1,21 @@
 // folding.cpp — driver for the FoldingOptimizer (FOLDING_SOLUTION_v2 §10).
 //
-// Two modes selected by argv:
+// Modes selected by argv:
 //   (default)  GUI: Polyscope viewer modeled line-by-line on the working
 //              idioms of optimization.cpp (init, YUp, registerSurfaceMesh,
 //              state::userCallback, updateVertexPositions, show).
 //   --eval     headless: run one complete fold with NO Polyscope call on the
 //              code path, print one CSV line (plus header) to stdout, exit.
-//   --sweep    headless parameter sweep (LHS 128 -> CEM), deterministic seed.
+//   --grid     exhaustive (alpha, T) grid for the symmetric fold (CHANGE 7):
+//              certifies the analytic arc optimum alpha* ~= 1.
+//   --sweep    headless optimizer (CHANGE 8): 5-scalar CEM execution
+//              calibration for symmetric folds, or spline + full-covariance
+//              CEM over a 10-D gripper path for the diagonal one-corner fold.
+//   --gfold    single headless run driving the OneCorner diagonal with the
+//              gravity-based g-fold triangular path (CHANGE 10).
 //
 // The evaluation core runFold(...) is self-contained (its own ClothMesh,
-// ClothController, integrator; no globals) so the eval and the sweep reuse it.
+// ClothController, integrator; no globals) so every mode reuses it.
 
 #include "cloth.h"
 #include "controller.h"
@@ -25,6 +31,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <random>
 #include <string>
@@ -46,10 +53,40 @@ struct RunConfig {
   int N = 10;
   FoldParams P;          // grip lives inside FoldParams
   bool trace = false;
+  bool gfold = false;    // CHANGE 10: drive the OneCorner diagonal with the g-fold path
+  // CHANGE 8: an externally supplied trajectory (spline sweep). When non-null,
+  // runFold drives the grip with this instead of generating an arc/g-fold.
+  const std::vector<TrajectoryPoint>* customTraj = nullptr;
 };
 
 static constexpr double kSpacing = 0.1;   // §7 defaults: s = 0.1
 static constexpr double kTol = 1e-9;
+
+// gravityScale resolution (CHANGE 1): the boolean realGravity is kept for
+// backward compatibility. If realGravity is on and gravityScale is still the
+// default 1.0, reproduce the old E2b behavior (g x N*N); otherwise gravityScale
+// is the continuous knob and is used directly.
+static double resolveGravityScale(const FoldParams& P, int N) {
+  if (P.realGravity && P.gravityScale == 1.0) return double(N) * double(N);
+  return P.gravityScale;
+}
+
+// Linear interpolation of a per-vertex waypoint list, replicating the
+// controller's interpolateTrajectory (E6): holds at positions.back() for
+// t >= times.back(); with times[0] == 0 and queried t >= 0 the pre-start
+// branch is never taken. Used to reconstruct the control target each step for
+// the gripper-energy metric (CHANGE 4a).
+static Eigen::Vector3d interpWaypoints(const std::vector<Eigen::Vector3d>& pos,
+                                       const std::vector<double>& times, double t) {
+  if (pos.empty()) return Eigen::Vector3d::Zero();
+  if (t <= times.front()) return pos.front();
+  if (t >= times.back()) return pos.back();
+  size_t k = 1;
+  while (k < times.size() && times[k] < t) ++k;
+  const double span = times[k] - times[k - 1];
+  const double a = span > 0 ? (t - times[k - 1]) / span : 0.0;
+  return pos[k - 1] + a * (pos[k] - pos[k - 1]);
+}
 
 // One classified spring: crossing iff its endpoints have r of strictly
 // opposite sign (both beyond tol) — classified ONCE at spec time (§10).
@@ -103,7 +140,13 @@ static FoldSpec makeSpec(const RunConfig& cfg, const FoldingOptimizer& opt) {
 //                        physical prevents, E8).
 //   M8 residualKE : mean of 0.5|v|^2 over M during the final 1 s — end-state
 //                        jitter (PBD vs controller fight, e.g. even-N crease).
+//   E gripperEnergy : sum over steps and GRIPPED vertices of max(0, F.dx) —
+//                        non-regenerative gripper work (raw; normalized to the
+//                        arc baseline inside the cost lambdas, CHANGE 4a/7/8).
 //   finite : false if any position goes non-finite (rollout aborts at once).
+// Substeps (CHANGE 4b): the integrator is subdivided into P.substeps steps of
+// dt/substeps per control step for stability at high stiffness / restored
+// gravity. Gravity uses gravityScale (CHANGE 1/4c).
 // ---------------------------------------------------------------------------
 static FoldMetrics runFold(const RunConfig& cfg) {
   const int N = cfg.N;
@@ -122,9 +165,10 @@ static FoldMetrics runFold(const RunConfig& cfg) {
   cloth.properties.bendingStiffness = P.bending;
   cloth.properties.damping = P.damping;
   // E1: the struct default gravity (0,0,-9.81) is HORIZONTAL vs the y=0
-  // ground — must be set explicitly. E2: the integrator applies g/Nv, so a
-  // drape run multiplies by Nv = vertex count to restore true gravity (E2b).
-  const double gScale = P.realGravity ? double(N) * double(N) : 1.0;
+  // ground — must be set explicitly. E2/E2b: the integrator applies g/Nv;
+  // gravityScale (resolved per CHANGE 1) restores true gravity (x N*N) or acts
+  // as a continuous drape knob.
+  const double gScale = resolveGravityScale(P, N);
   cloth.properties.gravity = gScale * Eigen::Vector3d(0.0, -9.81, 0.0);
 
   FoldingOptimizer opt(N, N, kSpacing);
@@ -136,7 +180,11 @@ static FoldMetrics runFold(const RunConfig& cfg) {
   std::vector<TrajectoryPoint> traj;
   {
     FoldParams params = P;
-    if (cfg.fold == FoldType::Diag)
+    if (cfg.customTraj)                       // CHANGE 8: spline sweep supplies its own path
+      traj = *cfg.customTraj;
+    else if (cfg.gfold)                       // CHANGE 10: g-fold triangular path (OneCorner diag)
+      traj = opt.gFoldTrajectory(cloth, Corner::FarRight, Corner::NearLeft, params);
+    else if (cfg.fold == FoldType::Diag)
       traj = opt.optimizeDiagonalFold(cloth, Corner::FarRight, Corner::NearLeft, P.T, params);
     else
       traj = opt.optimizeSymmetricFold(cloth, cfg.fold == FoldType::SymZ ? FoldDirection::AlongX
@@ -160,6 +208,15 @@ static FoldMetrics runFold(const RunConfig& cfg) {
   auto integrator = std::make_unique<SemiImplicitEulerIntegrator>();
   opt.applyFoldingTrajectory(controller, traj, P.gain, P.maxForce);
 
+  // CHANGE 4a: per-gripper waypoint lists, so we can reconstruct the control
+  // target (and hence the clamped control force F) each step for the energy
+  // metric. Only the gripped set contributes to gripperEnergy.
+  std::map<size_t, std::pair<std::vector<Eigen::Vector3d>, std::vector<double>>> gripWaypoints;
+  for (const TrajectoryPoint& tp : traj) {
+    gripWaypoints[tp.vertexIndex].first.push_back(tp.position);
+    gripWaypoints[tp.vertexIndex].second.push_back(tp.time);
+  }
+
   const int foldSteps = static_cast<int>(std::lround(P.T / P.dt));
   const int settleSteps = static_cast<int>(std::lround(P.settle / P.dt));
   const int totalSteps = foldSteps + settleSteps;
@@ -175,9 +232,20 @@ static FoldMetrics runFold(const RunConfig& cfg) {
   long keCount = 0;
 
   for (int step = 0; step < totalSteps; ++step) {
+    // CHANGE 4a: capture each gripper's position at the start of the control
+    // step (this is the position the controller reads when it computes F).
+    std::map<size_t, Eigen::Vector3d> posBefore;
+    for (const auto& kv : gripWaypoints)
+      posBefore[kv.first] = cloth.getVertex(kv.first).position;
+
     // Demo loop order (ground rules): controls, then physics, then clamps.
+    // CHANGE 4b: the controller runs ONCE per control step; the integrator is
+    // subdivided into P.substeps sub-steps of dt/substeps (the Simulation
+    // demo's own pattern, required for stability at high stiffness / restored
+    // gravity).
     controller.applyControls(cloth, P.dt);
-    integrator->step(cloth, P.dt);
+    const int substeps = std::max(1, P.substeps);
+    for (int sub = 0; sub < substeps; ++sub) integrator->step(cloth, P.dt / substeps);
 
     // E8: soft ground clamp replicated from the Optimization demo's frame
     // loop — y < 0.01 snaps to 0.01 with vy *= 0.3 (the integrator's own
@@ -205,6 +273,23 @@ static FoldMetrics runFold(const RunConfig& cfg) {
           cloth.velocities[v].y() *= 0.3;
         }
       }
+    }
+
+    // CHANGE 4a: gripper energy E — non-regenerative work the controller did
+    // this step, summed over gripped vertices. The controller applied
+    // F = clamp(gain*(target - pos_before), maxForce) as v += F*dt (E5);
+    // reconstruct F from the same target it used (its clock reads (step+1)*dt
+    // after applyControls) and dx = pos_after - pos_before. Only positive
+    // work counts (max(0, F.dx)): energy the gripper injects, not what the
+    // cloth returns.
+    const double controllerTime = (step + 1) * P.dt;
+    for (const auto& kv : gripWaypoints) {
+      const size_t v = kv.first;
+      const Eigen::Vector3d target = interpWaypoints(kv.second.first, kv.second.second, controllerTime);
+      Eigen::Vector3d F = P.gain * (target - posBefore[v]);
+      if (F.norm() > P.maxForce) F = F.normalized() * P.maxForce;
+      const Eigen::Vector3d dx = cloth.getVertex(v).position - posBefore[v];
+      m.gripperEnergy += std::max(0.0, F.dot(dx));
     }
 
     // ---- metrics block (§10; definitions in the function header) ----
@@ -312,6 +397,9 @@ struct ParsedArgs {
   std::string foldName = "sym";
   std::string gripName = "all";
   bool tSet = false;
+  // CHANGE 7: exhaustive symmetric grid controls (alpha x T) + energy weight.
+  int nAlpha = 25, nT = 20;
+  double wE = 0.2;
 };
 
 static bool parseArgs(int argc, char** argv, ParsedArgs& out) {
@@ -324,7 +412,8 @@ static bool parseArgs(int argc, char** argv, ParsedArgs& out) {
   };
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
-    if (a == "--eval" || a == "--sweep") continue;
+    if (a == "--eval" || a == "--sweep" || a == "--grid") continue;  // mode flags (no value)
+    else if (a == "--gfold") { out.cfg.gfold = true; }               // CHANGE 10 (no value)
     else if (a == "--fold") { out.foldName = need(i); ++i; }
     else if (a == "--grip") { out.gripName = need(i); ++i; }
     else if (a == "--N") { out.cfg.N = std::atoi(need(i)); ++i; }
@@ -340,6 +429,14 @@ static bool parseArgs(int argc, char** argv, ParsedArgs& out) {
     else if (a == "--layerClamp") { out.cfg.P.layerClamp = std::atoi(need(i)) != 0; ++i; }
     else if (a == "--settle") { out.cfg.P.settle = std::atof(need(i)); ++i; }
     else if (a == "--trace") { out.cfg.trace = std::atoi(need(i)) != 0; ++i; }
+    // CHANGE 6: new continuous knobs.
+    else if (a == "--alpha") { out.cfg.P.alpha = std::atof(need(i)); ++i; }
+    else if (a == "--substeps") { out.cfg.P.substeps = std::atoi(need(i)); ++i; }
+    else if (a == "--gravityScale") { out.cfg.P.gravityScale = std::atof(need(i)); ++i; }
+    // CHANGE 7: grid controls.
+    else if (a == "--Nalpha") { out.nAlpha = std::atoi(need(i)); ++i; }
+    else if (a == "--NT") { out.nT = std::atoi(need(i)); ++i; }
+    else if (a == "--wE") { out.wE = std::atof(need(i)); ++i; }
     else { std::cerr << "unknown flag: " << a << std::endl; return false; }
   }
 
@@ -361,17 +458,20 @@ static bool parseArgs(int argc, char** argv, ParsedArgs& out) {
 
 static void printCsv(const ParsedArgs& pa, const FoldMetrics& m) {
   const FoldParams& P = pa.cfg.P;
+  // CHANGE 5: added alpha, substeps, gravityScale (the resolved effective value
+  // that actually ran, per CHANGE 1) and gripperEnergy. Existing columns kept.
   std::cout << "fold,grip,N,T,gain,maxForce,eps,delta,stiff,bend,damp,realGravity,layerClamp,"
-               "settle,foldErrMean,foldErrMax,interiorStrainPeak,crossingMinLenRatio,"
-               "interpenetrations,residualKE,finite\n";
+               "settle,alpha,substeps,gravityScale,foldErrMean,foldErrMax,interiorStrainPeak,"
+               "crossingMinLenRatio,interpenetrations,residualKE,finite,gripperEnergy\n";
   std::cout << std::setprecision(6)
             << pa.foldName << ',' << pa.gripName << ',' << pa.cfg.N << ',' << P.T << ','
             << P.gain << ',' << P.maxForce << ',' << P.eps << ',' << P.delta << ','
             << P.stiffness << ',' << P.bending << ',' << P.damping << ','
             << (P.realGravity ? 1 : 0) << ',' << (P.layerClamp ? 1 : 0) << ',' << P.settle << ','
+            << P.alpha << ',' << P.substeps << ',' << resolveGravityScale(P, pa.cfg.N) << ','
             << m.foldErrMean << ',' << m.foldErrMax << ',' << m.interiorStrainPeak << ','
             << m.crossingMinLenRatio << ',' << m.interpenetrations << ',' << m.residualKE << ','
-            << (m.finite ? 1 : 0) << '\n';
+            << (m.finite ? 1 : 0) << ',' << m.gripperEnergy << '\n';
 }
 
 static int runEval(const ParsedArgs& pa) {
@@ -380,14 +480,290 @@ static int runEval(const ParsedArgs& pa) {
 }
 
 // ===========================================================================
-// --sweep : LHS(128) seeding + CEM refinement over pi = (T, gain, maxForce,
-// eps, delta) (§10). gain and maxForce are handled in log10-space. Cost:
+// --grid : EXHAUSTIVE 2D grid over (alpha, T) for the SYMMETRIC fold
+// (FOLDING_FINAL_FORMULATION §elliptical-family). Rationale for an exhaustive
+// grid: the symmetric search is only 2-D, so a grid is exact and fully
+// interpretable — it maps the whole Pareto surface and CERTIFIES that the
+// optimum lands at alpha* ~= 1 (the analytic rigid arc) rather than assuming
+// it. The objective is a black-box, non-smooth rollout functional (force
+// clamp + PBD projection + penalty), so no usable gradient exists; rollouts
+// are cheap (~65 ms), so dense sampling is practical.
+//
+// Cost:  J = 1.0*D + 1.0*S + wE*(E / E_ref) + 1000*(C>0 || !finite),
+// where E_ref is the gripper energy of the (alpha=1, SAME T) run, so E is
+// normalized to the rigid arc at that T. Prints one CSV row per cell and the
+// best (min-J) cell at the end.
+// ===========================================================================
+static int runGrid(const ParsedArgs& base) {
+  const int nA = std::max(2, base.nAlpha);
+  const int nT = std::max(2, base.nT);
+  const double wE = base.wE;
+
+  std::cout << "alpha,T,D,S,E,C,finite,J\n";
+  double bestJ = std::numeric_limits<double>::infinity();
+  double bestAlpha = 1.0, bestT = base.cfg.P.T;
+
+  for (int it = 0; it < nT; ++it) {
+    const double T = 2.0 + (10.0 - 2.0) * it / (nT - 1);
+
+    // E_ref: the rigid-arc (alpha=1) gripper energy at THIS T.
+    RunConfig ref = base.cfg;
+    ref.trace = false;
+    ref.P.alpha = 1.0;
+    ref.P.T = T;
+    const FoldMetrics refM = runFold(ref);
+    const double eRef = refM.gripperEnergy > 1e-12 ? refM.gripperEnergy : 1.0;
+
+    for (int ia = 0; ia < nA; ++ia) {
+      const double alpha = 0.5 + (1.2 - 0.5) * ia / (nA - 1);
+      RunConfig c = base.cfg;
+      c.trace = false;
+      c.P.alpha = alpha;
+      c.P.T = T;
+      const FoldMetrics m = runFold(c);
+      const double D = m.foldErrMean, S = m.interiorStrainPeak, E = m.gripperEnergy;
+      const int C = m.interpenetrations;
+      double J = 1.0 * D + 1.0 * S + wE * (E / eRef);
+      if (C > 0 || !m.finite) J += 1000.0;
+      std::cout << std::setprecision(6) << alpha << ',' << T << ',' << D << ',' << S << ','
+                << E << ',' << C << ',' << (m.finite ? 1 : 0) << ',' << J << '\n';
+      if (J < bestJ) { bestJ = J; bestAlpha = alpha; bestT = T; }
+    }
+  }
+
+  std::cout << "[grid] BEST J=" << std::setprecision(6) << bestJ
+            << " at alpha=" << bestAlpha << " T=" << bestT << std::endl;
+  return 0;
+}
+
+// ===========================================================================
+// CHANGE 8 — diagonal one-corner optimizer: cubic Catmull-Rom gripper path +
+// full-covariance CEM.
+//
+// Why genuine optimization here (not a grid): the one-corner diagonal has NO
+// closed-form ideal path — a single gripper cannot hold a 2-D sheet rigid, so
+// the trajectory that best trades fold error against stretch and energy must
+// be searched. The space is ~10-D (9 control-point coords + T) with
+// correlated parameters, where an exhaustive grid is hopeless; a
+// derivative-free method with a learned full covariance is the right tool
+// (the objective is a non-smooth black-box rollout, no gradient). A
+// differentiable simulator (e.g. SoftMAC) would enable gradient-based
+// trajectory optimization — future work, not this task.
+// ===========================================================================
+
+// Uniform Catmull-Rom segment P1->P2 with neighbors P0, P3 (endpoints
+// duplicated at the ends). Standard basis form.
+static Eigen::Vector3d catmullRom(const Eigen::Vector3d& p0, const Eigen::Vector3d& p1,
+                                  const Eigen::Vector3d& p2, const Eigen::Vector3d& p3, double t) {
+  const double t2 = t * t, t3 = t2 * t;
+  return 0.5 * ((2.0 * p1) + (-p0 + p2) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 +
+                (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+}
+
+// buildSplineTrajectory (CHANGE 8a): a cubic Catmull-Rom spline through
+// {start, p1, p2, p3, end} (start = gripped corner's rest position, end = its
+// mirror target, p1..p3 = 3 free interior control points). Discretized into
+// K+1 waypoints whose PATH parameter is cosine-eased (u_k = (1-cos(pi k/K))/2)
+// so speed vanishes at both ends, at strictly increasing times t_k = T k/K
+// (t_0 = 0 exactly, E6). vertexIndex added to the spec'd signature so the flat
+// TrajectoryPoint list carries its vertex.
+static std::vector<TrajectoryPoint> buildSplineTrajectory(size_t vertexIndex,
+                                                          const Eigen::Vector3d& cornerRest,
+                                                          const Eigen::Vector3d& cornerMirror,
+                                                          const Eigen::Vector3d& p1,
+                                                          const Eigen::Vector3d& p2,
+                                                          const Eigen::Vector3d& p3,
+                                                          double T, int K) {
+  const std::array<Eigen::Vector3d, 5> P = { cornerRest, p1, p2, p3, cornerMirror };
+  std::vector<TrajectoryPoint> out;
+  out.reserve(size_t(K) + 1);
+  for (int k = 0; k <= K; ++k) {
+    const double u = 0.5 * (1.0 - std::cos(M_PI * k / K));   // cosine-eased path parameter
+    const double s = std::min(std::max(u, 0.0), 1.0) * 4.0;  // 4 segments
+    int seg = std::min(3, static_cast<int>(std::floor(s)));
+    const double lt = s - seg;                               // local t in [0,1]
+    const Eigen::Vector3d& a = P[size_t(std::max(0, seg - 1))];
+    const Eigen::Vector3d& b = P[size_t(seg)];
+    const Eigen::Vector3d& c = P[size_t(seg + 1)];
+    const Eigen::Vector3d& d = P[size_t(std::min(4, seg + 2))];
+    out.push_back({ vertexIndex, catmullRom(a, b, c, d, lt), T * k / K });
+  }
+  return out;
+}
+
+static int runSweepDiagonal(const ParsedArgs& base) {
+  const int N = base.cfg.N;
+  const double h = base.cfg.P.h, s = kSpacing;
+  const int K = base.cfg.P.K;
+
+  FoldingOptimizer opt(N, N, s);
+  const FoldSpec spec = opt.computeFoldSpec(h, Corner::FarRight, Corner::NearLeft,
+                                            base.cfg.P.delta, base.cfg.P.eps);
+  const std::vector<size_t> grips = opt.gripSet(spec, GripMode::OneCorner);
+  if (grips.empty()) { std::cerr << "[sweep-diag] empty grip set" << std::endl; return 1; }
+  const size_t gripV = grips[0];
+  const int gi = static_cast<int>(gripV) / N, gj = static_cast<int>(gripV) % N;
+  const Eigen::Vector3d cornerRest(gj * s, h, gi * s);
+  Eigen::Vector3d cornerMirror = cornerRest;
+  for (size_t k = 0; k < spec.moving.size(); ++k)
+    if (spec.moving[k] == gripV) cornerMirror = spec.mirrorTargets[k];
+
+  // Seed the 3 interior control points ON the analytic alpha=1 arc.
+  FoldParams arcParams = base.cfg.P;
+  arcParams.alpha = 1.0;
+  arcParams.T = 6.0;
+  std::vector<double> arcTimes;
+  const std::vector<Eigen::Vector3d> arcPts = opt.arc(cornerRest, spec, arcParams, arcTimes);
+  const std::array<Eigen::Vector3d, 3> seedP = { arcPts[size_t(K / 4)], arcPts[size_t(K / 2)],
+                                                 arcPts[size_t(3 * K / 4)] };
+
+  // E_ref: gripper energy of the analytic arc (OneCorner diagonal, T=6).
+  auto arcRefConfig = [&]() {
+    RunConfig c = base.cfg;
+    c.fold = FoldType::Diag;
+    c.P.grip = GripMode::OneCorner;
+    c.P.alpha = 1.0;
+    c.P.T = 6.0;
+    c.gfold = false;
+    c.customTraj = nullptr;
+    return c;
+  };
+  const double eRef = std::max(1e-12, runFold(arcRefConfig()).gripperEnergy);
+
+  // 10-D box: each control coord in seed +/- 0.45 m; T in [2,10]. The arc seed
+  // maps to z = 0.5 in every dimension.
+  constexpr int D = 10;
+  std::array<double, D> lo{}, hi{};
+  for (int p = 0; p < 3; ++p)
+    for (int c = 0; c < 3; ++c) {
+      lo[size_t(3 * p + c)] = seedP[size_t(p)][c] - 0.45;
+      hi[size_t(3 * p + c)] = seedP[size_t(p)][c] + 0.45;
+    }
+  lo[9] = 2.0; hi[9] = 10.0;
+
+  auto zToTraj = [&](const std::array<double, D>& z) {
+    Eigen::Vector3d p1, p2, p3;
+    for (int c = 0; c < 3; ++c) {
+      p1[c] = lo[size_t(c)]     + z[size_t(c)]     * (hi[size_t(c)]     - lo[size_t(c)]);
+      p2[c] = lo[size_t(3 + c)] + z[size_t(3 + c)] * (hi[size_t(3 + c)] - lo[size_t(3 + c)]);
+      p3[c] = lo[size_t(6 + c)] + z[size_t(6 + c)] * (hi[size_t(6 + c)] - lo[size_t(6 + c)]);
+    }
+    const double T = lo[9] + z[9] * (hi[9] - lo[9]);
+    return std::make_pair(buildSplineTrajectory(gripV, cornerRest, cornerMirror, p1, p2, p3, T, K), T);
+  };
+  auto cost = [&](const std::array<double, D>& z, FoldMetrics& m) {
+    auto tr = zToTraj(z);
+    RunConfig c = base.cfg;
+    c.fold = FoldType::Diag;
+    c.P.grip = GripMode::OneCorner;
+    c.P.T = tr.second;
+    c.gfold = false;
+    c.customTraj = &tr.first;
+    m = runFold(c);
+    double J = m.foldErrMean + m.interiorStrainPeak + base.wE * (m.gripperEnergy / eRef);
+    if (m.interpenetrations > 0 || !m.finite) J += 1000.0;
+    return J;
+  };
+
+  std::mt19937 rng(1234);
+  std::uniform_real_distribution<double> uni(0.0, 1.0);
+  std::normal_distribution<double> gauss(0.0, 1.0);
+
+  // Pre-scan: LHS(128) (seed included at z = 0.5) -> keep best 16 as the
+  // initial elite pool.
+  const int NS = 128;
+  std::array<std::vector<int>, D> perms;
+  for (auto& pm : perms) {
+    pm.resize(size_t(NS));
+    for (int k = 0; k < NS; ++k) pm[size_t(k)] = k;
+    std::shuffle(pm.begin(), pm.end(), rng);
+  }
+  std::vector<std::pair<double, std::array<double, D>>> pool;
+  {
+    std::array<double, D> seedZ; seedZ.fill(0.5);   // the analytic arc
+    FoldMetrics m; pool.emplace_back(cost(seedZ, m), seedZ);
+  }
+  for (int k = 0; k < NS; ++k) {
+    std::array<double, D> z;
+    for (int d = 0; d < D; ++d) z[size_t(d)] = (perms[size_t(d)][size_t(k)] + uni(rng)) / NS;
+    FoldMetrics m; pool.emplace_back(cost(z, m), z);
+  }
+  std::sort(pool.begin(), pool.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+  pool.resize(16);
+  auto best = pool.front();
+  std::cout << "[sweep-diag] LHS best J=" << std::setprecision(5) << best.first << std::endl;
+
+  // Full-covariance CEM: fit a 10-D Gaussian to the elites, sample via its
+  // Cholesky factor (with a small diagonal jitter for positive-definiteness),
+  // refit on the elite 8 each iteration. (The spec permits full-covariance CEM
+  // in place of CMA-ES; this IS that, labelled.)
+  Eigen::VectorXd mean(D);
+  Eigen::MatrixXd cov(D, D);
+  auto fit = [&](const std::vector<std::pair<double, std::array<double, D>>>& elites) {
+    mean.setZero();
+    for (const auto& e : elites)
+      for (int d = 0; d < D; ++d) mean[d] += e.second[size_t(d)];
+    mean /= double(elites.size());
+    cov.setZero();
+    for (const auto& e : elites) {
+      Eigen::VectorXd x(D);
+      for (int d = 0; d < D; ++d) x[d] = e.second[size_t(d)];
+      cov += (x - mean) * (x - mean).transpose();
+    }
+    cov /= double(elites.size());
+    cov += Eigen::MatrixXd::Identity(D, D) * 1e-4;   // jitter: PD + sigma floor
+  };
+  fit(pool);
+
+  for (int iter = 1; iter <= 12; ++iter) {
+    Eigen::LLT<Eigen::MatrixXd> llt(cov);
+    const Eigen::MatrixXd L = llt.matrixL();
+    std::vector<std::pair<double, std::array<double, D>>> gen;
+    for (int k = 0; k < 32; ++k) {
+      Eigen::VectorXd n(D);
+      for (int d = 0; d < D; ++d) n[d] = gauss(rng);
+      const Eigen::VectorXd x = mean + L * n;
+      std::array<double, D> z;
+      for (int d = 0; d < D; ++d) z[size_t(d)] = std::clamp(x[d], 0.0, 1.0);
+      FoldMetrics m; gen.emplace_back(cost(z, m), z);
+    }
+    std::sort(gen.begin(), gen.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    if (gen.front().first < best.first) best = gen.front();
+    gen.resize(8);                                   // elite 8
+    fit(gen);
+    std::cout << "[sweep-diag] iter " << iter << " best J=" << std::setprecision(5)
+              << best.first << std::endl;
+  }
+
+  // Report the best 10-parameter trajectory and its full metric line.
+  auto tr = zToTraj(best.second);
+  RunConfig c = base.cfg;
+  c.fold = FoldType::Diag;
+  c.P.grip = GripMode::OneCorner;
+  c.P.T = tr.second;
+  c.customTraj = &tr.first;
+  std::cout << "[sweep-diag] FINAL spline path (start + p1,p2,p3 + end), T=" << tr.second << std::endl;
+  ParsedArgs pa = base;
+  pa.cfg = c;
+  pa.cfg.customTraj = nullptr;   // printCsv only reads scalar params
+  pa.foldName = "diag";
+  pa.gripName = "corner";
+  printCsv(pa, runFold(c));
+  return 0;
+}
+
+// ===========================================================================
+// --sweep : for the SYMMETRIC fold this is EXECUTION CALIBRATION — LHS(128)
+// seeding + diagonal-Gaussian CEM over the 5 execution scalars
+// (T, gain, maxForce, eps, delta) (§10); gain/maxForce in log10-space. Cost:
 //   J = foldErrMean + 0.5*interiorStrainPeak
 //       + 1000*(interpenetrations > 0 || !finite || interiorStrainPeak > 0.15)
-// Deterministic (fixed seed). Prints the running best, ends with the best
-// parameters and their full metric line.
+// For the DIAGONAL fold, --sweep dispatches to the spline + full-covariance
+// CEM path (CHANGE 8), the genuine trajectory optimization. Deterministic.
 // ===========================================================================
 static int runSweep(const ParsedArgs& base) {
+  if (base.cfg.fold == FoldType::Diag) return runSweepDiagonal(base);   // CHANGE 8c
+
   struct Dim { const char* name; double lo, hi; bool logScale; };
   const std::array<Dim, 5> dims = {{ { "T", 2.0, 10.0, false },
                                      { "gain", 500.0, 8000.0, true },
@@ -510,6 +886,7 @@ struct State {
 
   bool folding = false;
   double simTime = 0.0;
+  bool useGfold = false;   // CHANGE 10: drive the OneCorner diagonal with the g-fold path
 
   bool haveSpec = false;
   FoldSpec spec;
@@ -546,8 +923,7 @@ static void rebuild(State& st) {
   st.cloth.properties.stiffness = st.P.stiffness;
   st.cloth.properties.bendingStiffness = st.P.bending;
   st.cloth.properties.damping = st.P.damping;
-  const double gScale = st.P.realGravity ? double(st.N) * double(st.N) : 1.0;
-  st.cloth.properties.gravity = gScale * Eigen::Vector3d(0.0, -9.81, 0.0);
+  st.cloth.properties.gravity = resolveGravityScale(st.P, st.N) * Eigen::Vector3d(0.0, -9.81, 0.0);
   st.psMesh = polyscope::registerSurfaceMesh("Cloth", st.cloth.getVertexMatrix(),
                                              st.cloth.getTriangleMatrix());
   st.psMesh->setSurfaceColor({ 0.2, 0.8, 0.4 });
@@ -582,7 +958,9 @@ static void startFold(State& st) {
 
   std::vector<TrajectoryPoint> traj;
   FoldParams params = st.P;
-  if (st.fold == FoldType::Diag)
+  if (st.useGfold && st.fold == FoldType::Diag)   // CHANGE 10: g-fold gravity path
+    traj = opt.gFoldTrajectory(st.cloth, Corner::FarRight, Corner::NearLeft, params);
+  else if (st.fold == FoldType::Diag)
     traj = opt.optimizeDiagonalFold(st.cloth, Corner::FarRight, Corner::NearLeft, st.P.T, params);
   else
     traj = opt.optimizeSymmetricFold(st.cloth, st.fold == FoldType::SymZ ? FoldDirection::AlongX
@@ -628,15 +1006,17 @@ static int run() {
     st.cloth.properties.stiffness = st.P.stiffness;
     st.cloth.properties.bendingStiffness = st.P.bending;
     st.cloth.properties.damping = st.P.damping;
-    const double gScale = st.P.realGravity ? double(st.N) * double(st.N) : 1.0;
-    st.cloth.properties.gravity = gScale * Eigen::Vector3d(0.0, -9.81, 0.0);
+    st.cloth.properties.gravity = resolveGravityScale(st.P, st.N) * Eigen::Vector3d(0.0, -9.81, 0.0);
 
-    // Demo loop order: controls -> physics -> clamps -> render update.
+    // Demo loop order: controls -> physics -> clamps -> render update. The
+    // integrator is subdivided into P.substeps sub-steps (CHANGE 4b) so the
+    // GUI matches the headless rollout at high stiffness / restored gravity.
     if (st.folding) {
       st.controller.applyControls(st.cloth, st.P.dt);
       st.simTime += st.P.dt;
     }
-    st.integrator->step(st.cloth, st.P.dt);
+    const int guiSubsteps = std::max(1, st.P.substeps);
+    for (int sub = 0; sub < guiSubsteps; ++sub) st.integrator->step(st.cloth, st.P.dt / guiSubsteps);
 
     // E8: the Optimization demo's soft ground clamp, replicated verbatim.
     for (size_t i = 0; i < st.cloth.getVertexCount(); ++i) {
@@ -719,12 +1099,21 @@ static int run() {
       sliderD("maxForce", &st.P.maxForce, 100.0f, 800.0f, "%.0f");
       sliderD("eps (layer gap)", &st.P.eps, 0.005f, 0.05f, "%.3f");
       sliderD("delta (crease slack)", &st.P.delta, 0.0f, 0.06f, "%.3f");
+      // CHANGE 9: elliptical-family + stability knobs. alpha shapes the arc
+      // height (1 = rigid arc); substeps and gravityScale are the stability /
+      // drape knobs. The GUI reads st.P live into the arc + cloth each frame,
+      // so these flow through automatically. Run --grid / --sweep headless,
+      // then set the sliders to the printed best (optimizer is NOT in the GUI).
+      sliderD("alpha (arc height)", &st.P.alpha, 0.5f, 1.2f, "%.3f");
+      sliderD("gravityScale", &st.P.gravityScale, 1.0f, 200.0f, "%.0f");
+      ImGui::SliderInt("substeps", &st.P.substeps, 1, 8);
       sliderD("stiffness", &st.P.stiffness, 100.0f, 5000.0f, "%.0f");
       sliderD("damping", &st.P.damping, 0.3f, 0.95f, "%.2f");
       ImGui::PopItemWidth();
       ImGui::Checkbox("realGravity (E2b: g x N^2)", &st.P.realGravity);
       ImGui::SameLine();
       ImGui::Checkbox("layerClamp", &st.P.layerClamp);
+      ImGui::Checkbox("g-fold path (OneCorner diagonal)", &st.useGfold);
 
       ImGui::Separator();
       ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.7f, 0.2f, 1.0f));
@@ -750,8 +1139,9 @@ static int run() {
                          "Folding: %s", st.folding ? "ACTIVE" : "idle");
       ImGui::Text("Sim time: %.2f s", st.simTime);
       ImGui::Text("Controlled vertices: %zu", st.controller.getControlCount());
-      ImGui::Text("Live fold error (M1): %.4f of L", st.liveFoldErr);
-      ImGui::Text("Live interior strain (M2): %.4f", st.liveStrain);
+      ImGui::Text("alpha: %.3f%s", st.P.alpha, st.useGfold ? "  [g-fold]" : "");
+      ImGui::Text("Live fold error D (M1): %.4f of L", st.liveFoldErr);
+      ImGui::Text("Live interior strain S (M2): %.4f", st.liveStrain);
     }
     ImGui::End();
   };
@@ -766,16 +1156,20 @@ int main(int argc, char** argv) {
   // §4 invariant checks first; stderr keeps --eval's stdout CSV clean.
   if (!selfTest()) return 1;
 
-  bool eval = false, sweep = false;
+  bool eval = false, sweep = false, grid = false, gfold = false;
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--eval") == 0) eval = true;
     if (std::strcmp(argv[i], "--sweep") == 0) sweep = true;
+    if (std::strcmp(argv[i], "--grid") == 0) grid = true;
+    if (std::strcmp(argv[i], "--gfold") == 0) gfold = true;
   }
 
-  if (eval || sweep) {
+  if (eval || sweep || grid || gfold) {
     ParsedArgs pa;
     if (!parseArgs(argc, argv, pa)) return 2;
-    return sweep ? runSweep(pa) : runEval(pa);
+    if (sweep) return runSweep(pa);      // symmetric CEM or diagonal spline+CMA (CHANGE 8)
+    if (grid) return runGrid(pa);        // exhaustive alpha x T (CHANGE 7)
+    return runEval(pa);                  // --eval, or --gfold single run (CHANGE 10)
   }
   return gui::run();
 }
