@@ -93,7 +93,10 @@ static Eigen::Vector3d interpWaypoints(const std::vector<Eigen::Vector3d>& pos,
 // Crossing springs are the ones forced away from rest by the fold itself
 // (predicted crossing length law: s*cos(theta/2)); all others ("interior")
 // should stay at rest length under the rigid-rotation trajectory (§7).
-struct SpringRef { int v0, v1; double rest; bool crossing; };
+// The engine's distanceConstraints are structural only (rest s); there are no
+// skip-one constraints — bendingConstraints (rest 2s) are the only other list.
+// touching: exactly one endpoint has |r| <= kTol (crease-touching spring).
+struct SpringRef { int v0, v1; double rest; bool crossing; bool touching; };
 
 static std::vector<SpringRef> classifySprings(const ClothMesh& cloth, const FoldSpec& spec) {
   std::vector<SpringRef> out;
@@ -105,10 +108,11 @@ static std::vector<SpringRef> classifySprings(const ClothMesh& cloth, const Fold
     for (const Edge& e : edges) {
       const double r0 = rOf(e.v0), r1 = rOf(e.v1);
       const bool crossing = (r0 > kTol && r1 < -kTol) || (r0 < -kTol && r1 > kTol);
-      out.push_back({ e.v0, e.v1, e.restLength, crossing });
+      const bool touching = (std::abs(r0) <= kTol) != (std::abs(r1) <= kTol);
+      out.push_back({ e.v0, e.v1, e.restLength, crossing, touching });
     }
   };
-  classify(cloth.distanceConstraints);   // structural (rest s) and skip-one
+  classify(cloth.distanceConstraints);   // structural (rest s) — no skip-one constraints
   classify(cloth.bendingConstraints);    // bending (rest 2s) — E3: no shear springs exist
   return out;
 }
@@ -180,6 +184,11 @@ static FoldMetrics runFold(const RunConfig& cfg) {
   std::vector<TrajectoryPoint> traj;
   {
     FoldParams params = P;
+    if (cfg.gfold && cfg.fold != FoldType::Diag) {
+      std::cerr << "[runFold] --gfold requires the diagonal fold" << std::endl;
+      m.finite = false;
+      return m;
+    }
     if (cfg.customTraj)                       // CHANGE 8: spline sweep supplies its own path
       traj = *cfg.customTraj;
     else if (cfg.gfold)                       // CHANGE 10: g-fold triangular path (OneCorner diag)
@@ -230,6 +239,11 @@ static FoldMetrics runFold(const RunConfig& cfg) {
 
   double keSum = 0.0;
   long keCount = 0;
+  // Argmax tracking for interiorStrainPeak (FIX 5c).
+  int argmaxV0 = -1, argmaxV1 = -1;
+  double argmaxRest = 0.0;
+  bool argmaxTouching = false;
+  int argmaxStep = -1;
 
   for (int step = 0; step < totalSteps; ++step) {
     // CHANGE 4a: capture each gripper's position at the start of the control
@@ -313,7 +327,14 @@ static FoldMetrics runFold(const RunConfig& cfg) {
         ++nCross;
         m.crossingMinLenRatio = std::min(m.crossingMinLenRatio, ratio);
       } else {
-        m.interiorStrainPeak = std::max(m.interiorStrainPeak, std::abs(len - sp.rest) / sp.rest);
+        const double strain = std::abs(len - sp.rest) / sp.rest;
+        if (strain > m.interiorStrainPeak) {
+          m.interiorStrainPeak = strain;
+          argmaxV0 = sp.v0; argmaxV1 = sp.v1;
+          argmaxRest = sp.rest; argmaxTouching = sp.touching;
+          argmaxStep = step;
+        }
+        if (sp.touching) m.touchStrainPeak = std::max(m.touchStrainPeak, strain);
       }
     }
 
@@ -334,6 +355,11 @@ static FoldMetrics runFold(const RunConfig& cfg) {
   }
 
   m.residualKE = keCount > 0 ? keSum / static_cast<double>(keCount) : 0.0;
+
+  // Print the spring that dominates interiorStrainPeak (FIX 5c).
+  std::cerr << "[strain-argmax] v0=" << argmaxV0 << " v1=" << argmaxV1
+            << " rest=" << argmaxRest << " touching=" << (argmaxTouching ? 1 : 0)
+            << " step=" << argmaxStep << " peak=" << m.interiorStrainPeak << std::endl;
 
   // M1: end-state placement error over ALL of M, as a fraction of side L.
   const double L = (N - 1) * kSpacing;
@@ -397,6 +423,8 @@ struct ParsedArgs {
   std::string foldName = "sym";
   std::string gripName = "all";
   bool tSet = false;
+  bool gripSet = false;   // FIX 3: track whether --grip was explicitly passed
+  bool foldSet = false;  // FIX 3: track whether --fold was explicitly passed
   // CHANGE 7: exhaustive symmetric grid controls (alpha x T) + energy weight.
   int nAlpha = 25, nT = 20;
   double wE = 0.2;
@@ -414,8 +442,8 @@ static bool parseArgs(int argc, char** argv, ParsedArgs& out) {
     const std::string a = argv[i];
     if (a == "--eval" || a == "--sweep" || a == "--grid") continue;  // mode flags (no value)
     else if (a == "--gfold") { out.cfg.gfold = true; }               // CHANGE 10 (no value)
-    else if (a == "--fold") { out.foldName = need(i); ++i; }
-    else if (a == "--grip") { out.gripName = need(i); ++i; }
+    else if (a == "--fold") { out.foldName = need(i); out.foldSet = true; ++i; }
+    else if (a == "--grip") { out.gripName = need(i); out.gripSet = true; ++i; }
     else if (a == "--N") { out.cfg.N = std::atoi(need(i)); ++i; }
     else if (a == "--T") { out.cfg.P.T = std::atof(need(i)); out.tSet = true; ++i; }
     else if (a == "--gain") { out.cfg.P.gain = std::atof(need(i)); ++i; }
@@ -440,6 +468,13 @@ static bool parseArgs(int argc, char** argv, ParsedArgs& out) {
     else { std::cerr << "unknown flag: " << a << std::endl; return false; }
   }
 
+  // FIX 3: --gfold forces the diagonal fold and (if --grip was not explicitly
+  // given) the corner grip so the run is self-consistent.
+  if (out.cfg.gfold) {
+    if (!out.foldSet) out.foldName = "diag";
+    if (!out.gripSet) out.gripName = "corner";
+  }
+
   if (out.foldName == "sym") out.cfg.fold = FoldType::SymZ;
   else if (out.foldName == "symx") out.cfg.fold = FoldType::SymX;
   else if (out.foldName == "diag") out.cfg.fold = FoldType::Diag;
@@ -462,7 +497,7 @@ static void printCsv(const ParsedArgs& pa, const FoldMetrics& m) {
   // that actually ran, per CHANGE 1) and gripperEnergy. Existing columns kept.
   std::cout << "fold,grip,N,T,gain,maxForce,eps,delta,stiff,bend,damp,realGravity,layerClamp,"
                "settle,alpha,substeps,gravityScale,foldErrMean,foldErrMax,interiorStrainPeak,"
-               "crossingMinLenRatio,interpenetrations,residualKE,finite,gripperEnergy\n";
+               "crossingMinLenRatio,interpenetrations,residualKE,finite,gripperEnergy,touchStrainPeak\n";
   std::cout << std::setprecision(6)
             << pa.foldName << ',' << pa.gripName << ',' << pa.cfg.N << ',' << P.T << ','
             << P.gain << ',' << P.maxForce << ',' << P.eps << ',' << P.delta << ','
@@ -471,7 +506,7 @@ static void printCsv(const ParsedArgs& pa, const FoldMetrics& m) {
             << P.alpha << ',' << P.substeps << ',' << resolveGravityScale(P, pa.cfg.N) << ','
             << m.foldErrMean << ',' << m.foldErrMax << ',' << m.interiorStrainPeak << ','
             << m.crossingMinLenRatio << ',' << m.interpenetrations << ',' << m.residualKE << ','
-            << (m.finite ? 1 : 0) << ',' << m.gripperEnergy << '\n';
+            << (m.finite ? 1 : 0) << ',' << m.gripperEnergy << ',' << m.touchStrainPeak << '\n';
 }
 
 static int runEval(const ParsedArgs& pa) {
@@ -499,7 +534,7 @@ static int runGrid(const ParsedArgs& base) {
   const int nT = std::max(2, base.nT);
   const double wE = base.wE;
 
-  std::cout << "alpha,T,D,S,E,C,finite,J\n";
+  std::cout << "alpha,T,D,S,E,C,resKE,finite,J\n";
   double bestJ = std::numeric_limits<double>::infinity();
   double bestAlpha = 1.0, bestT = base.cfg.P.T;
 
@@ -526,7 +561,66 @@ static int runGrid(const ParsedArgs& base) {
       double J = 1.0 * D + 1.0 * S + wE * (E / eRef);
       if (C > 0 || !m.finite) J += 1000.0;
       std::cout << std::setprecision(6) << alpha << ',' << T << ',' << D << ',' << S << ','
-                << E << ',' << C << ',' << (m.finite ? 1 : 0) << ',' << J << '\n';
+                << E << ',' << C << ',' << m.residualKE << ',' << (m.finite ? 1 : 0) << ',' << J << '\n';
+      if (J < bestJ) { bestJ = J; bestAlpha = alpha; bestT = T; }
+    }
+  }
+
+  std::cout << "[grid] BEST J=" << std::setprecision(6) << bestJ
+            << " at alpha=" << bestAlpha << " T=" << bestT << std::endl;
+  return 0;
+}
+
+// ===========================================================================
+// --grid --fold diag : exhaustive (alpha, T) grid for the DIAGONAL fold,
+// one-corner (far-corner) grip. Mirrors runGrid but with FoldType::Diag and
+// GripMode::OneCorner forced. The same alpha (elliptical arc height) and T
+// (fold duration) parametrize the one-corner trajectory via the shared arc()
+// function, so the 2-D grid has the same semantic as for the symmetric fold.
+// Cost:  J = 1.0*D + 1.0*S + wE*(E / E_ref) + 1000*(C>0 || !finite)
+// where E_ref = gripper energy of the (alpha=1, SAME T) diagonal run.
+// ===========================================================================
+static int runGridDiagonal(const ParsedArgs& base) {
+  const int nA = std::max(2, base.nAlpha);
+  const int nT = std::max(2, base.nT);
+  const double wE = base.wE;
+
+  std::cout << "alpha,T,D,S,E,C,resKE,finite,J\n";
+  double bestJ = std::numeric_limits<double>::infinity();
+  double bestAlpha = 1.0, bestT = base.cfg.P.T;
+
+  for (int it = 0; it < nT; ++it) {
+    const double T = 2.0 + (10.0 - 2.0) * it / (nT - 1);
+
+    // E_ref: the rigid-arc (alpha=1, OneCorner diagonal) gripper energy at THIS T.
+    RunConfig ref = base.cfg;
+    ref.fold = FoldType::Diag;
+    ref.P.grip = GripMode::OneCorner;
+    ref.trace = false;
+    ref.gfold = false;
+    ref.customTraj = nullptr;
+    ref.P.alpha = 1.0;
+    ref.P.T = T;
+    const FoldMetrics refM = runFold(ref);
+    const double eRef = refM.gripperEnergy > 1e-12 ? refM.gripperEnergy : 1.0;
+
+    for (int ia = 0; ia < nA; ++ia) {
+      const double alpha = 0.5 + (1.2 - 0.5) * ia / (nA - 1);
+      RunConfig c = base.cfg;
+      c.fold = FoldType::Diag;
+      c.P.grip = GripMode::OneCorner;
+      c.trace = false;
+      c.gfold = false;
+      c.customTraj = nullptr;
+      c.P.alpha = alpha;
+      c.P.T = T;
+      const FoldMetrics m = runFold(c);
+      const double D = m.foldErrMean, S = m.interiorStrainPeak, E = m.gripperEnergy;
+      const int C = m.interpenetrations;
+      double J = 1.0 * D + 1.0 * S + wE * (E / eRef);
+      if (C > 0 || !m.finite) J += 1000.0;
+      std::cout << std::setprecision(6) << alpha << ',' << T << ',' << D << ',' << S << ','
+                << E << ',' << C << ',' << m.residualKE << ',' << (m.finite ? 1 : 0) << ',' << J << '\n';
       if (J < bestJ) { bestJ = J; bestAlpha = alpha; bestT = T; }
     }
   }
@@ -735,14 +829,41 @@ static int runSweepDiagonal(const ParsedArgs& base) {
               << best.first << std::endl;
   }
 
-  // Report the best 10-parameter trajectory and its full metric line.
+  // Report the best 10-parameter trajectory and its full metric line (FIX 1).
   auto tr = zToTraj(best.second);
   RunConfig c = base.cfg;
   c.fold = FoldType::Diag;
   c.P.grip = GripMode::OneCorner;
   c.P.T = tr.second;
   c.customTraj = &tr.first;
-  std::cout << "[sweep-diag] FINAL spline path (start + p1,p2,p3 + end), T=" << tr.second << std::endl;
+
+  // Decode winning control points from best.second using the same lo/hi mapping.
+  Eigen::Vector3d winP1, winP2, winP3;
+  for (int ci = 0; ci < 3; ++ci) {
+    winP1[ci] = lo[size_t(ci)]     + best.second[size_t(ci)]     * (hi[size_t(ci)]     - lo[size_t(ci)]);
+    winP2[ci] = lo[size_t(3 + ci)] + best.second[size_t(3 + ci)] * (hi[size_t(3 + ci)] - lo[size_t(3 + ci)]);
+    winP3[ci] = lo[size_t(6 + ci)] + best.second[size_t(6 + ci)] * (hi[size_t(6 + ci)] - lo[size_t(6 + ci)]);
+  }
+  std::cout << std::setprecision(9)
+            << "[sweep-diag] start   = (" << cornerRest.x()   << ", " << cornerRest.y()   << ", " << cornerRest.z()   << ")\n"
+            << "[sweep-diag] p1      = (" << winP1.x()        << ", " << winP1.y()        << ", " << winP1.z()        << ")\n"
+            << "[sweep-diag] p2      = (" << winP2.x()        << ", " << winP2.y()        << ", " << winP2.z()        << ")\n"
+            << "[sweep-diag] p3      = (" << winP3.x()        << ", " << winP3.y()        << ", " << winP3.z()        << ")\n"
+            << "[sweep-diag] end     = (" << cornerMirror.x() << ", " << cornerMirror.y() << ", " << cornerMirror.z() << ")\n"
+            << "[sweep-diag] T       = " << tr.second << "\n";
+  std::cout << std::setprecision(6);   // restore for subsequent output
+
+  // Write the winning trajectory's K+1 waypoints to best_diag_spline.csv (FIX 1).
+  {
+    std::ofstream splineFile("best_diag_spline.csv");
+    splineFile << "k,t,x,y,z\n";
+    for (size_t wi = 0; wi < tr.first.size(); ++wi) {
+      const TrajectoryPoint& tp = tr.first[wi];
+      splineFile << std::setprecision(9) << wi << ',' << tp.time << ','
+                 << tp.position.x() << ',' << tp.position.y() << ',' << tp.position.z() << '\n';
+    }
+  }
+
   ParsedArgs pa = base;
   pa.cfg = c;
   pa.cfg.customTraj = nullptr;   // printCsv only reads scalar params
@@ -1129,6 +1250,7 @@ static int run() {
         st.P.layerClamp = true;
         st.P.stiffness = 2500.0;
         st.P.settle = 2.5;
+        st.P.substeps = 8;
       }
       ImGui::PopStyleColor();
 
@@ -1168,7 +1290,10 @@ int main(int argc, char** argv) {
     ParsedArgs pa;
     if (!parseArgs(argc, argv, pa)) return 2;
     if (sweep) return runSweep(pa);      // symmetric CEM or diagonal spline+CMA (CHANGE 8)
-    if (grid) return runGrid(pa);        // exhaustive alpha x T (CHANGE 7)
+    if (grid) {
+      if (pa.cfg.fold == FoldType::Diag) return runGridDiagonal(pa);
+      return runGrid(pa);               // exhaustive alpha x T (CHANGE 7)
+    }
     return runEval(pa);                  // --eval, or --gfold single run (CHANGE 10)
   }
   return gui::run();

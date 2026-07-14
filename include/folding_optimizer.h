@@ -80,6 +80,7 @@ struct FoldParams {
 struct FoldMetrics {
   double foldErrMean = 0, foldErrMax = 0;      // M1, fraction of L
   double interiorStrainPeak = 0;               // M2, over non-crossing springs, whole rollout
+  double touchStrainPeak = 0;                  // peak over interior springs with exactly one endpoint |r| <= tol (crease-touching)
   double crossingMinLenRatio = 1;              // min crossing length / rest (companion of M3)
   int    interpenetrations = 0;                // M6
   double residualKE = 0;                       // M8, mean KE of M over last 1 s of settle
